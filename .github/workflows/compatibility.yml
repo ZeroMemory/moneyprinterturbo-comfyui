@@ -1,0 +1,73 @@
+name: MoneyPrinterTurbo compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '19 5 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: MoneyPrinterTurbo target (latest, a release tag, or pinned main)
+        default: latest
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.version.outputs.sha }}
+      tag: ${{ steps.version.outputs.tag }}
+      trial: ${{ steps.version.outputs.trial }}
+      main_sha: ${{ steps.main.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: main
+        name: Resolve pinned upstream main
+        env:
+          REQUESTED_TAG: main
+        run: python3 -I -S .github/scripts/compatibility.py resolve
+      - id: version
+        name: Resolve requested upstream version
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || (github.event_name == 'schedule' && 'latest') || 'baseline' }}
+        run: python3 -I -S .github/scripts/compatibility.py resolve
+
+  test:
+    name: Check
+    needs: release
+    uses: ./.github/workflows/verify.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}
+      sha: ${{ needs.release.outputs.sha }}
+      trial: ${{ needs.release.outputs.trial == 'true' }}
+  test-main:
+    name: Check pinned main
+    needs: release
+    if: needs.release.outputs.tag != 'main'
+    uses: ./.github/workflows/verify.yml
+    with:
+      tag: main
+      sha: ${{ needs.release.outputs.main_sha }}
+  reproduce:
+    name: Recheck
+    if: failure() && needs.test.result == 'failure' && github.event_name == 'schedule'
+    needs: [release, test]
+    uses: ./.github/workflows/verify.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}
+      sha: ${{ needs.release.outputs.sha }}
+      trial: ${{ needs.release.outputs.trial == 'true' }}
+  support:
+    name: Review support / ${{ needs.release.outputs.tag }} / ${{ needs.release.outputs.sha }}
+    if: needs.release.outputs.trial == 'true' && github.event_name == 'schedule'
+    needs: [release, test]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'The compatibility trial passed on all platforms. Review this release for inclusion in the installer.'

@@ -1,0 +1,169 @@
+diff --git a/test/services/test_webui_grouped_select.py b/test/services/test_webui_grouped_select.py
+index b8da77ee090152cd55d916c55ceaa070d69a47f1..0e2f7b3d1eda4f1fa6555e3e8fb8b0ec477e9c1e 100644
+--- a/test/services/test_webui_grouped_select.py
++++ b/test/services/test_webui_grouped_select.py
+@@ -1,13 +1,16 @@
+ from contextlib import contextmanager
++import json
+ from pathlib import Path
++import sys
+ from types import SimpleNamespace
+ from unittest.mock import patch
+ 
++import pytest
+ import streamlit as st
+ from streamlit.testing.v1 import AppTest
+ 
+ from app.config import config
+-from app.services import voice
++from app.services import ltx, voice
+ 
+ 
+ ROOT_DIR = Path(__file__).parent.parent.parent
+@@ -100,8 +103,10 @@ def test_grouped_video_source_ignores_unknown_event_and_repairs_saved_value():
+         assert harness.calls[-1]["data"]["value"] == "pexels"
+ 
+ 
+-def test_grouped_video_source_keeps_groups_and_accessible_label_binding():
++@pytest.mark.parametrize("enabled", [False, True])
++def test_grouped_video_source_keeps_groups_and_accessible_label_binding(enabled, monkeypatch):
+     """组件数据应保持分组顺序，并为可见标签提供稳定控件 ID。"""
++    monkeypatch.setitem(config.ltx, "enabled", enabled)
+     harness = _GroupedSelectHarness()
+     with _running_app(harness):
+         data = harness.calls[-1]["data"]
+@@ -128,4 +133,5 @@ def test_grouped_video_source_keeps_groups_and_accessible_label_binding():
+             "local",
++            *(["ltx"] if enabled else []),
+         ]
+ 
+         # AppTest 当前不会暴露 Components v2 的内部 DOM，因此同时校验组件声明
+@@ -135,6 +141,128 @@ def test_grouped_video_source_keeps_groups_and_accessible_label_binding():
+         assert "flex-wrap: wrap" in harness.declaration["css"]
+ 
+ 
++def test_local_comfyui_model_round_trip(monkeypatch, tmp_path):
++    request = tmp_path / "request.json"
++    request.write_text(json.dumps({"variant": {"model_version": "2.3"}}), encoding="utf-8")
++    monkeypatch.setattr(config, "ltx", {"enabled": True, "request_template": str(request),
++                                        "python_executable": sys.executable, "operator_script": __file__})
++    harness = _GroupedSelectHarness()
++    with patch.object(st, "download_button", wraps=st.download_button) as download, _running_app(harness, saved_video_source="ltx") as app:
++        picker = app.selectbox(key="ltx_model_select_en")
++        assert picker.label == "Local video model"
++        assert picker.options == ["LTX-2.5", "LTX-2.3", "MiniMax H3"]
++        assert picker.value == "2.3"
++        assert app.number_input(key="ltx_scene_seconds").value == 3
++        text_provider = config.app.get("llm_provider")
++        picker.set_value("h3").run()
++        assert not app.exception
++        assert config.app["llm_provider"] == text_provider
++        assert any("--model-version h3" in warning.value for warning in app.warning)
++        duration = app.number_input(key="h3_scene_seconds")
++        assert (duration.min, duration.max, duration.value) == (4, 15, 5)
++        duration.set_value(15).run()
++        exported = next(call.kwargs["data"] for call in reversed(download.call_args_list)
++                        if call.kwargs.get("key") == "export_settings_preset_button")
++        params = json.loads(exported)["params"]
++        assert (params["video_source"], params["ltx_model_version"]) == ("ltx", "h3")
++        assert params["ltx_scene_duration_seconds"] == 15
++        app.selectbox(key="ltx_model_select_en").set_value("2.5").run()
++        assert app.number_input(key="ltx_scene_seconds").value == 3
++        app.session_state["settings_preset_payload"] = params
++        app.run()
++        assert not app.exception
++        assert app.selectbox(key="ltx_model_select_en").value == config.app["ltx_model_version"] == "h3"
++        assert app.number_input(key="h3_scene_seconds").value == 15
++        assert not any("Metaso MiniMax API Key" in w.value for w in app.warning)
++
++
++def test_local_clip_size_presets_custom_input_and_task_restore(monkeypatch, tmp_path):
++    key = "ltx_size_h3_16:9"
++    monkeypatch.setitem(config.ui, key, [])  # Previous versions stored an empty size for Default.
++    template = tmp_path / "h3.json"
++    template.write_text(json.dumps({
++        "variant": {"model_version": "h3", "adapter_family": "minimax-h3-t2v"},
++        "api_prompt": {
++            "1": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {"width": 864, "height": 480}},
++            "2": {"class_type": "SamplerCustomAdvanced", "inputs": {"latent_image": ["1", 1]}},
++            "3": {"class_type": "VAEDecode", "inputs": {"samples": ["2", 0]}},
++            "4": {"class_type": "CreateVideo", "inputs": {"images": ["3", 0]}},
++            "5": {"class_type": "SaveVideo", "inputs": {"video": ["4", 0]}},
++        },
++    }), encoding="utf-8")
++    monkeypatch.setattr(config, "ltx", {
++        "enabled": True, "request_template": str(template),
++        "python_executable": sys.executable, "operator_script": __file__,
++    })
++    with (
++        patch.object(st, "download_button", wraps=st.download_button) as download,
++        _running_app(_GroupedSelectHarness(), saved_video_source="ltx") as app,
++    ):
++        def export_params():
++            assert not app.exception
++            data = next(call.kwargs["data"] for call in reversed(download.call_args_list)
++                        if call.kwargs.get("key") == "export_settings_preset_button")
++            return json.loads(data)["params"]
++
++        def exported_size():
++            params = export_params()
++            return params["ltx_generation_width"], params["ltx_generation_height"]
++
++        def select_size(mode):
++            app.selectbox(key=f"{key}_en").set_value(mode).run()
++            return exported_size()
++
++        aspect = "video_aspect_for_ltx_en"
++        assert exported_size() == (768, 1344)
++        assert "ltx_size_h3_9:16" not in config.ui
++        app.session_state[f"{key}_en"] = "default"
++        app.selectbox(key=aspect).set_value("16:9").run()
++        picker = app.selectbox(key=f"{key}_en")
++        recommended = (1344, 768)
++        assert picker.value == exported_size() == recommended
++        assert config.ui[key] == []
++        options = ltx.resolution_presets("h3", "16:9").values()
++        assert picker.options == [
++            *(f"{w} × {h}" + (" · Recommended" if (w, h) == recommended else "") for w, h in options), "Custom"
++        ]
++        assert "Clip and final video · 1344 × 768 px" in [c.value for c in app.caption]
++        for size in options:
++            if size != recommended:
++                assert select_size(size) == size
++        current_size = exported_size()
++        assert select_size("custom") == current_size
++        width_key = f"{key}_width"
++        app.number_input(key=width_key).set_value(1602).run()
++        custom = export_params()
++        assert exported_size() == (1600, current_size[1])
++        app.selectbox(key=aspect).set_value("1:1").run()
++        square = app.selectbox(key="ltx_size_h3_1:1_en")
++        assert square.value == exported_size() == (768, 768)
++        assert "ltx_size_h3_1:1" not in config.ui
++        assert "Clip and final video · 768 × 768 px" in [c.value for c in app.caption]
++        app.selectbox(key="ltx_model_select_en").set_value("2.5").run()
++        app.selectbox(key="ltx_model_select_en").set_value("h3").run()
++        app.selectbox(key=aspect).set_value("16:9").run()
++        assert app.number_input(key=width_key).value == 1600
++        assert select_size(recommended) == recommended
++        assert config.ui[key] == list(recommended)
++        app.session_state["settings_preset_payload"] = custom
++        app.run()
++        assert export_params()["ltx_generation_width"] == app.number_input(key=width_key).value == 1600
++        legacy = {k: v for k, v in custom.items() if k not in {"ltx_generation_width", "ltx_generation_height"}}
++        app.session_state["task_restore_payload"] = {"task_id": "old-h3", "params": legacy}
++        app.run()
++        assert app.selectbox(key=f"{key}_en").value == "custom"
++        assert app.number_input(key=width_key).value == 864
++        assert exported_size() == (864, 480)
++        assert config.ui[key] == list(recommended)
++        assert "Clip and final video · 864 × 480 px" in [c.value for c in app.caption]
++        template.write_text('{"variant":{"model_version":"h3"}}', encoding="utf-8")
++        app.run()
++        assert not any(box.key.startswith("ltx_size_") for box in app.selectbox if box.key)
++        assert export_params()["ltx_generation_width"] is None
++
++
+ def test_stock_concurrency_only_appears_for_stock_sources():
+     """库存并发仅对三家库存素材显示，切换来源时保留显式设置。"""
+     harness = _GroupedSelectHarness()

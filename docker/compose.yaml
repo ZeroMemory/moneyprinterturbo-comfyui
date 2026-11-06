@@ -1,0 +1,35 @@
+services:
+  mpt:
+    image: moneyprinterturbo-comfyui:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    init: true
+    network_mode: host
+    environment:
+      MPT_HOME: /data
+      MPT_MODELS: ${MPT_MODELS:-2.5}
+      COMFYUI_ENDPOINT: ${COMFYUI_ENDPOINT:-http://127.0.0.1:8188}
+      MPT_WEBUI_PORT: ${MPT_WEBUI_PORT:-8501}
+      MPT_API_KEY: ${MPT_API_KEY:-}
+    volumes:
+      - type: bind
+        source: ${MPT_DATA_DIR:-./data}
+        target: /data
+      - type: bind
+        source: ${COMFYUI_DIR:?Set COMFYUI_DIR to the folder containing main.py}
+        target: /comfyui
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${COMFYUI_MODELS_DIR:-${COMFYUI_DIR}/models}
+        target: /comfyui/models
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${COMFYUI_DIR}/custom_nodes
+        target: /comfyui/custom_nodes
+        bind:
+          create_host_path: false

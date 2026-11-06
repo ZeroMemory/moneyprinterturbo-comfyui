@@ -1,0 +1,124 @@
+name: Verify installed integration
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      trial:
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  platform:
+    name: ${{ matrix.os }} / ${{ inputs.tag }} / ${{ inputs.sha }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      UV_NO_PROGRESS: '1'
+      TAG: ${{ inputs.tag }}
+      UPSTREAM_SHA: ${{ inputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: addon
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: harry0703/MoneyPrinterTurbo
+          ref: ${{ inputs.tag == 'main' && inputs.sha || format('refs/tags/{0}', inputs.tag) }}
+          path: upstream
+          persist-credentials: false
+      - name: Name the pinned main checkout
+        if: inputs.tag == 'main'
+        shell: bash
+        run: git -C upstream branch main "$UPSTREAM_SHA"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install FFmpeg on Linux
+        if: runner.os == 'Linux'
+        run: command -v ffmpeg && command -v ffprobe || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+      - name: Install FFmpeg on macOS
+        if: runner.os == 'macOS'
+        run: command -v ffmpeg && command -v ffprobe || brew install ffmpeg
+      - name: Install FFmpeg on Windows
+        if: runner.os == 'Windows'
+        run: |
+          if (!(Get-Command ffmpeg -ErrorAction SilentlyContinue) -or !(Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg --yes --no-progress
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            "$env:ChocolateyInstall\bin" >> $env:GITHUB_PATH
+          }
+      - name: Install upstream dependencies
+        shell: bash
+        run: |
+          python -m pip install uv==0.11.19
+          uv sync --locked --no-build --no-install-project --project upstream --python 3.12
+          ffmpeg -version
+          ffprobe -version
+      - name: Run installed integration scenarios
+        id: integration
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then exe=upstream/.venv/Scripts/python.exe; else exe=upstream/.venv/bin/python; fi
+          exe=$(python -I -S -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$exe")
+          python -I -S addon/.github/scripts/compatibility.py check --hosted-result --upstream upstream --sha "$UPSTREAM_SHA" --tag "$TAG" --python "$exe"
+      - name: Scenario / install
+        if: steps.integration.outputs.failed_stage == 'install'
+        shell: bash
+        run: exit 1
+      - name: Scenario / repeat
+        if: steps.integration.outputs.failed_stage == 'repeat'
+        shell: bash
+        run: exit 1
+      - name: Scenario / media
+        if: steps.integration.outputs.failed_stage == 'media'
+        shell: bash
+        run: exit 1
+      - name: Scenario / features
+        if: steps.integration.outputs.failed_stage == 'features'
+        shell: bash
+        run: exit 1
+      - name: Scenario / render
+        if: steps.integration.outputs.failed_stage == 'render'
+        shell: bash
+        run: exit 1
+      - name: Scenario / uninstall
+        if: steps.integration.outputs.failed_stage == 'uninstall'
+        shell: bash
+        run: exit 1
+      - name: Scenario / restore
+        if: steps.integration.outputs.failed_stage == 'restore'
+        shell: bash
+        run: exit 1
+      - name: Verify installed PyPI package
+        if: inputs.tag != 'main' && !inputs.trial
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then exe=upstream/.venv/Scripts/python.exe; else exe=upstream/.venv/bin/python; fi
+          exe=$(python -I -S -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$exe")
+          uv pip install --no-deps --link-mode copy --python "$exe" "mpt==${TAG#v}"
+          python -I -S addon/.github/scripts/check_package.py --python "$exe" --work-dir "$RUNNER_TEMP/mpt-package-check"
+      - name: Verify pinned v1.3.9 Docker image with a ComfyUI fixture
+        if: runner.os == 'Linux' && inputs.tag == 'v1.3.9' && !inputs.trial
+        shell: bash
+        run: |
+          docker build -f addon/docker/Dockerfile -t moneyprinterturbo-comfyui:ci addon
+          docker run --rm moneyprinterturbo-comfyui:ci cli --help
+          for model in 2.5 2.3 h3; do
+            docker run --rm --entrypoint python -e MPT_SMOKE_CONTAINER=1 \
+              --mount "type=bind,src=$GITHUB_WORKSPACE/addon/tests,dst=/addon-test/tests,readonly" \
+              moneyprinterturbo-comfyui:ci -B /addon-test/tests/smoke_mpt.py \
+              --mpt /MoneyPrinterTurbo --work-dir /tmp/mpt-docker-smoke --model-version "$model"
+          done

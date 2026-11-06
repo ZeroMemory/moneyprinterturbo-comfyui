@@ -1,0 +1,7 @@
+* text=auto
+*.sh text eol=lf
+*.command text eol=lf
+*.cmd text eol=crlf
+*.patch -text
+mpt/** text eol=lf
+runtime/workflows/**/*.json text eol=lf
